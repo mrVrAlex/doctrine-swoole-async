@@ -1,0 +1,537 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Doctrine, Swoole & concurrency (async)</title>
+    <!-- Подключение базовых стилей Reveal.js -->
+    <link rel="stylesheet" href="reveal.js/dist/reveal.css">
+    <!-- Вы можете выбрать любую тему: black, white, league, etc. -->
+    <link rel="stylesheet" href="reveal.js/dist/theme/black.css">
+    <link rel="stylesheet" href="reveal.js/plugin/highlight/monokai.css">
+
+    <style>
+        /* Дополнительные стили при необходимости */
+        .reveal .slides section {
+            /* Убираем прокрутку, если она установлена */
+            overflow: visible !important;
+            /* Настройка отступов, как вам нужно */
+            padding: 10px;
+            box-sizing: border-box;
+        }
+
+        .highlight-red {
+            color: red;
+        }
+
+        .highlight-yellow {
+            color: yellow;
+        }
+
+        .reveal .slides section pre {
+            margin: 0 auto; /* обнуляем внешние отступы */
+            padding: 1px; /* задаём внутренние отступы по вашему желанию */
+            max-height: none; /* убираем ограничение по высоте */
+            overflow: visible; /* отключаем появление скроллбара */
+            box-sizing: border-box; /* учитываем отступы при расчёте высоты */
+            width: 100%;
+            max-width: 100%;
+        }
+
+        .reveal .slides section pre code {
+            max-height: none;
+            max-width: max-content;
+            box-sizing: border-box;
+            margin: 1px;
+            padding: 1px;
+        }
+
+    </style>
+</head>
+<body>
+<div class="reveal">
+    <div class="slides">
+        <!-- Первый слайд -->
+        <section>
+            <h2>Doctrine, Swoole & concurrency (async)</h2>
+            <p>Working in coroutines with DB...</p>
+        </section>
+        <!-- Второй слайд -->
+        <section>
+            <h2>Swoole + PDO = async way</h2>
+            <p>&nbsp;</p>
+            <p>&nbsp;</p>
+            <p> PDO (included PgSql pdo-driver) support async IO (coroutines) out of box (since Swoole >= v5.1)</p>
+            <p>&nbsp;</p>
+            <p>&nbsp;</p>
+            <p>&nbsp;</p>
+        </section>
+        <!-- Третий слайд -->
+        <section>
+            <h2>Swoole + PDO = async way</h2>
+            <pre>
+                <code class="php">
+        // go() - alias to Swoole\Coroutine::create();
+        go(function () {
+            $pdo = new PDO(...);
+            $pdo->exec('SELECT sleep(1)');
+        });
+        go(function () {
+            $pdo = new PDO(...);
+            $pdo->exec('SELECT sleep(1)');
+        });
+        go(function () {
+            $pdo = new PDO(...);
+            $pdo->exec('SELECT sleep(1)');
+        });
+        Swoole\Event::wait();
+        // script run time = 1 sec
+                </code>
+            </pre>
+        </section>
+        <section>
+            <h2>Swoole HTTP Server</h2>
+            <p class="highlight-red"><i>non-coroutine mode</i></p>
+            <p>PHP <s>must</s> not die</p>
+            <pre>
+                <code class="php">
+$http = new Swoole\Http\Server('0.0.0.0', 9501, SWOOLE_PROCESS);
+$http->set([
+    'enable_coroutine' => false,
+    'worker_num' => 1
+]);
+$http->on('Request', function ($request, $response) {
+    sleep(1); // blocking operation
+    $response->end('<h1>Hello Swoole!</h1>');
+});
+$http->start();
+                </code>
+            </pre>
+        </section>
+        <section>
+            <h2>Swoole HTTP Server</h2>
+                        <p class="highlight-red"><i>non-coroutine mode</i></p>
+                        <p>Doctrine ORM: works + connection re-unsing</p>
+            <pre>
+                <code class="php">
+$http->on('Request', function ($request, $response) {
+    $entityManager = DI::get(EntityManagerInterface::class);
+    $user = $entityManager->find(User::class, 1);
+    $name = $user->getName();
+    $user->incrementPageViews();
+    $entityManager->persist($user);
+    $entityManager->flush();
+    $response->end('<h1>Hello ' . $name . '</h1>');
+});
+                </code>
+            </pre>
+        </section>
+        <section>
+            <h2>Swoole HTTP Server</h2>
+            <p class="highlight-red"><i>non-coroutine mode</i></p>
+            <p>Doctrine ORM - one problem</p>
+            <p>EntityManager: $_uow; - UnitOfWork is stateful</p>
+            <pre><code class="php">
+                $entityManager->find(User::class, 1);
+                $entityManager->find(User::class, 2);
+                // need on each request:
+                $entityManager->clear();
+            </code></pre>
+        </section>
+        <section>
+            <h2>HTTP Server: coroutine mode</h2>
+            <p class="highlight-red"> 1 RPS vs 10k-100k+ RPS</p>
+            <pre>
+                <code class="php">
+$http = new Swoole\Http\Server('0.0.0.0', 9501, SWOOLE_PROCESS);
+$http->set([
+    'enable_coroutine' => true,
+    'worker_num' => 1,
+    'hook_flags' => SWOOLE_HOOK_ALL,
+]);
+$http->on('Request', function ($request, $response) {
+    sleep(1); // async IO (non-blocking operation)
+    $response->end('<h1>Hello Swoole!</h1>');
+});
+$http->start();
+                </code>
+            </pre>
+        </section>
+        <section>
+            <h2>HTTP Server: coroutine mode</h2>
+            <p>Doctrine ORM? Stateful problems</p>
+            <pre><code class="php">
+    $user = $entityManager->find(User::class, 1);
+    $user->incrementPageViews();
+            </code></pre>
+            <hr/>
+            <pre><code class="php">
+    $entityManager->flush();
+    $entityManager->clear();
+            </code></pre>
+            <p class="highlight-red">We should emulate dying PHP</p>
+        </section>
+        <section>
+            <h2>Simplest solution:</h2>
+            <p class="highlight-red">Single EM for each requests</p>
+            <hr/>
+            <p>Each request = new coroutine</p>
+            <p>For each coroutine exist own context (storage)</p>
+            <p>EntityManager has interface</p>
+            <p>Can decorate: abstract EntityManagerDecorator</p>
+        </section>
+        <section>
+            <h2>EM decorator implementation</h2>
+            <p>Single EM for each requests</p>
+            <pre>
+                <code class="php">
+final class EntityManager extends EntityManagerDecorator
+{
+    protected ArrayObject $fallbackContext;
+    protected $wrapped {
+        get {
+            $context = $this->getContext();
+            if (! isset($context[self::class])) {
+                $context[self::class] = ($this->emCreatorFn)();
+            }
+            return $context[self::class];
+        }
+    }
+    public function __construct(private Closure $emCreatorFn)
+    {
+        $this->fallbackContext = new ArrayObject();
+    }
+    private function getContext() : Co\Context|ArrayObject
+    {
+        return Co::getContext((int) Co::getCid()) ?? $this->fallbackContext;
+    }
+}
+                </code>
+            </pre>
+        </section>
+        <section>
+            <h2>EM decorator: case #1 </h2>
+            <p class="highlight-red">EM factory: create new Connection</p>
+            <p>Doctrine ORM works as usual:</p>
+            <ul>
+            <li>with cache no performance penalty</li>
+                <li><span class="highlight-yellow">new DB connection for each request</span></li>
+            </ul>
+        </section>
+        <section>
+                    <h2>EM decorator: case #2 </h2>
+                    <p class="highlight-red">EM factory: DBAL Connection in DI (one time)</p>
+                </section>
+        <section>
+            <h2>EM decorator: case #2 </h2>
+            <p class="highlight-red">EM factory: DBAL Connection in DI (one time)</p>
+            <p>Swoole or SQL errors:</p>
+            <ul>
+            <li> <code style="font-size: 60%">Socket#6 has already been bound to another coroutine#2, reading or writing of the same socket in
+                coroutine#3 at the same time is not allowed</code></li>
+            <li> <code style="font-size: 60%">SQLSTATE[HY000]: General error: 7 another command is already in progress</code></li>
+            </ul>
+        </section>
+        <section>
+            <h2>Avoiding DB concurrency </h2>
+            <p>Locking or Pooling?</p>
+        </section>
+        <section>
+            <h2>Avoiding DB concurrency </h2>
+            <p class="highlight-red">Locking (wait if anyone work with)...</p>
+            <ul>
+                <li> hard implement</li>
+                <li> not effective (like in blocking mode)</li>
+            </ul>
+        </section>
+        <section>
+            <h2>Avoiding DB concurrency </h2>
+            <p class="highlight-red"> Need connection DB pool</p>
+        </section>
+        <section>
+            <h2>Connection DB pool</h2>
+            <p class="highlight-red">Infrastructure solution </p>
+            <ul>
+            <li> No DI for DBAL connection (new connect in each requests)</li>
+            <li> sidekick: DB connection pooler/proxy (like pgBouncer)
+                <ul>
+                 <li> APP -> connect to Pooler</li>
+                 <li> Pooler keep real connection to DB</li>
+                 <li> No coding </li>
+                </ul>
+            </li>
+            </ul>
+        </section>
+        <section>
+        <h2>Pooling mode:</h2>
+        <p>
+            <ul>
+                <li>per request</li>
+                <li>per transaction</li>
+                <li>per statement</li>
+            </ul>
+        </p>
+        </section>
+        <section>
+            <h2>Pooling mode: per request </h2>
+            <pre><code class="php">
+        $connection = $entityManager->getConnection();
+        $connection->query('SELECT sleep(1)'); // connection established
+        // Now in DB pool N-1 available connections
+        sleep(1);
+        $connection->query('SELECT sleep(1)'); // reuse connection again
+        sleep(1);
+        // After 4sec processing this request, connection will be released
+            </code></pre>
+        </section>
+        <section>
+            <h2>Pooling mode: per statement </h2>
+            <pre><code class="php">
+        $connection = $entityManager->getConnection();
+        $connection->query('SELECT sleep(1)'); // connection established
+        // PHP keep fake connect
+        sleep(1);
+        $connection->query('SELECT sleep(1)'); // get new connection again
+        sleep(1);
+        // After 4sec processing this request
+        // real DB connection used 2 times (total 2sec)
+            </code></pre>
+
+        </section>
+        <section>
+            <h2>Pooling mode: per statement </h2>
+            <p>absolute performance</p>
+            <p>connection using inconsistency</p>
+            <pre><code class="php">
+        $connection->query('BEGIN TRANSACTION');
+        $connection->query('SELECT sleep(1)'); // hello NEW connection!!!
+        $connection->query('COMMIT'); // No opened transaction
+            </code></pre>
+        </section>
+        <section>
+            <h2>Pooling mode: per transaction </h2>
+            <p>allocate real DB connection if transaction started</p>
+            <pre><code class="php">
+        $connection->query('BEGIN TRANSACTION');
+        $connection->query('SELECT sleep(1)'); // connection established
+        // PHP keep fake connect
+        sleep(1);
+        $connection->query('SELECT sleep(1)'); // get new connection again
+        $connection->query('COMMIT');
+        sleep(1);
+        // After 4sec processing this request
+        // real DB connection used 2 times (total 3sec)
+                        </code></pre>
+        </section>
+        <section>
+            <h2>Pooling mode: results </h2>
+            <p> 4 sec response time </p>
+            <p> 2 sec total SQL time</p>
+            <p class="highlight-red"> 1 connection was busy (4 sec) vs (2 sec) vs (3 sec)</p>
+        </section>
+        <section>
+            <h2>DB Pooling</h2>
+            <p class="highlight-red">Software (custom) solution for full control of connection</p>
+            <ul>
+                <li>when open/close (TTL)</li>
+                <li>own algorithm of choosing</li>
+                <li>no additional infrastructure</li>
+                <li>no side effects with proxy/network and single point of failure</li>
+            </ul>
+        </section>
+        <section>
+            <h2>Look inside Doctrine code </h2>
+            <p>ORM -> DBAL Connection</p>
+            <pre><code class="php">
+                    $connection = $entityManager->getConnection();
+            </code></pre>
+            <ul>
+                <li>Doctrine\DBAL\Connection</li>
+                <li>Doctrine\DBAL\Statement</li>
+                <li>Doctrine\DBAL\Result</li>
+            </ul>
+        </section>
+        <section>
+            <h2>Look inside Doctrine code </h2>
+            <p>ORM -> DBAL Connection -> Driver</p>
+            <pre><code class="php">
+        // inside Doctrine\DBAL\Connection
+        protected Driver $driver
+
+        interface Doctrine\DBAL\Driver
+        {
+            public function connect(
+                array $params,
+            ): DriverConnection; // Doctrine\DBAL\Driver\Connection
+            public function getDatabasePlatform(ServerVersionProvider $versionProvider): AbstractPlatform;
+            public function getExceptionConverter(): ExceptionConverter;
+        }
+            </code></pre>
+        </section>
+        <section>
+            <h2>Look inside Doctrine code </h2>
+            <p>ORM -> DBAL Connection -> Driver (interfaces)</p>
+            <ul>
+            <li>Doctrine\DBAL\Driver</li>
+            <li>Doctrine\DBAL\Driver\Connection </li>
+            <li>Doctrine\DBAL\Driver\Statement </li>
+            <li>Doctrine\DBAL\Driver\Result </li>
+            </ul>
+        </section>
+        <section>
+            <h2>Look inside Doctrine code </h2>
+            <p>ORM -> DBAL Connection -> Driver (classes) -> Native (PDO)</p>
+            <p>Termins: DBAL Connection, Driver Connection, Native Connection</p>
+        </section>
+        <section>
+            <h2>Doctrine Points of extend: </h2>
+            <p>Driver Middlewares: compositing drivers</p>
+            <p>Doctrine\DBAL\Driver\Middleware (interface)</p>
+            <pre><code class="php"> public function wrap(DriverInterface $driver): DriverInterface </code></pre>
+        </section>
+        <section>
+                    <h2>Doctrine Points of extend: </h2>
+                    <p>Logging feature</p>
+                    <p>$dbalConnection = DriverManager::getConnection()</p>
+            <p>Middleware::wrap(Doctrine\DBAL\Driver\PDO\PgSQL\Driver) => Doctrine\DBAL\Logging\Driver</p>
+                    <p>connect() -> parent connect + own logic = return Doctrine\DBAL\Logging\Connection wrap</p>
+                </section>
+        <section>
+            <h2>Step 1: statement mode </h2>
+            <p class="highlight-red">Base: new connection per request (first SQL using)</p>
+            <p>Life hack: Magic of PDO destructors</p>
+            <p>Just not persist driver connection in DBAL $_conn..</p>
+        </section>
+        <section>
+            <h2>Step 1: statement mode </h2>
+            <p class="highlight-red">Base: new connection per request (first SQL using)</p>
+            <pre><code class="php">
+        $connection = $entityManager->getConnection();
+        $connection->executeQuery('SELECT sleep(1)');
+        $connection->close(); // Magic of destructors: DB disconnect!
+        // another work
+        $result = $connection->executeQuery('SELECT version');
+        echo $result->fetchOne(); // while ($row = $result->fetchAssociative()) { ... }
+        $connection->close();
+        // another work
+            </code>
+            </pre>
+        </section>
+        <section>
+            <h2>Step 1: statement mode </h2>
+            <p>Look on DBAL Connection</p>
+            <ul>
+                <li> all access via internal connect()</li>
+                <li> connect: via Driver::connect </li>
+                <li> not final & extendable by design!</li>
+            </ul>
+        </section>
+        <section>
+            <h2>Step 1: statement mode </h2>
+            <p>Setup ConnectionWrapper for DBAL Connection</p>
+            <pre><code class="php">
+        $connection = $entityManager->getConnection();
+        $connection->executeQuery('SELECT sleep(1)');
+        // Magic of destructors: DB disconnect!
+        $result = $connection->executeQuery('SELECT version');
+        echo $result->fetchOne(); // while ($row = $result->fetchAssociative()) { ... }
+        // Again disconnect!
+            </code></pre>
+        </section>
+        <section>
+            <h2>Step 2: PoC </h2>
+            <p>get connection from pool</p>
+            <p>make a work</p>
+            <p>release connection back to pool</p>
+            <p>Magic of destructors</p>
+        </section>
+        <section>
+            <h2>Step 2: base Driver </h2>
+            <p>Middleware for wrap (chain) driver</p>
+            <p>Own Driver class (compositing over driver)</p>
+            <p>Own Driver Connection </p>
+            <p>Own Driver Statement </p>
+            <p>Own Driver Result </p>
+        </section>
+        <section>
+            <h2>Step 3: Connection (Pool) Manager </h2>
+            <p>connect & looking</p>
+        </section>
+        <section>
+            <h2>Step 3.1: Lock on connect </h2>
+            <p>no concurrency when we search connection</p>
+        </section>
+        <section>
+            <h2>Step 3.2: PoolStack (Channel) </h2>
+            <p>Connection storage like a stack (FIFO)</p>
+            <p>$this->poolStack->pop($this->config->waitAvailableTimeout)</p>
+        </section>
+        <section>
+            <h2>Step 3.3: Weak map - opened </h2>
+            <p> how many exist</p>
+        </section>
+        <section>
+            <h2>Step 3.4: Create connection</h2>
+            <p>makeSlot(): create real connection (driver)</p>
+        </section>
+        <section>
+            <h2>Step 3.5: Slot for connection </h2>
+            <p>useful Wrapper</p>
+            <p>using in weak map </p>
+        </section>
+        <section>
+            <h2>Again reference count (keep object) </h2>
+            <p>Why in connection inject to statement/result</p>
+        </section>
+        <section>
+            <h2>Moment of truth: release </h2>
+            <p>Back connection to pool for reusing in this or another parallel coroutines (requests)</p>
+        </section>
+        <section>
+            <h2>Step 3.6: Sorting? </h2>
+            <p>60min - MAX ttl, 5min - withoutActivityTtl</p>
+            <p>60 / 48 / 38 / 29 / 22 / 16 / 11 / 8 / 6 / 5 </p>
+        </section>
+        <section>
+            <h2>Edge cases</h2>
+            <p>Connection lost, broken, etc</p>
+        </section>
+        <section>
+            <h2>But wait. Pooling mode </h2>
+            <p>Transaction problem</p>
+        </section>
+        <section>
+                    <h2>Potential problems </h2>
+                    <p>Queries in allocated (in transaction)</p>
+                    <p>Error handling (not call deallocate)</p>
+                </section>
+        <section>
+                    <h2>Native connection (pdo) </h2>
+                    <p>No need any (pool) logic: just create new</p>
+                </section>
+        <section>
+                    <h2>Done...</h2>
+                </section>
+    </div>
+</div>
+
+<!-- Подключение JavaScript Reveal.js -->
+<script src="reveal.js/dist/reveal.js"></script>
+<script src="reveal.js/plugin/highlight/highlight.js"></script>
+<script>
+    // Инициализация Reveal.js
+    Reveal.initialize({
+        width: 1124,
+        height: 750,
+        display: 'block',
+        margin: 0.1,
+        // Дополнительные настройки можно указать здесь
+        transition: 'fade',
+        controls: true,
+        progress: true,
+        history: true,
+        center: true,
+        plugins: [RevealHighlight]
+    });
+</script>
+</body>
+</html>
